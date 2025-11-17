@@ -1,0 +1,497 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import re
+from collections import Counter
+import random
+import zipfile
+
+# Configuración
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Usando dispositivo: {device}")
+
+# Extraer y procesar datos del archivo zip
+def extraer_y_procesar_datos(zip_path='archive.zip'):
+    """Extrae y procesa los datos del archivo zip"""
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            # Buscar el archivo correcto
+            archivos_posibles = ['spa.txt', 'spa_eng.txt', 'esp_eng.txt', 'es_en.txt', 'eng_spa.txt']
+            archivo_encontrado = None
+            
+            for archivo in archivos_posibles:
+                if archivo in zip_ref.namelist():
+                    archivo_encontrado = archivo
+                    break
+            
+            if not archivo_encontrado:
+                for archivo in zip_ref.namelist():
+                    if archivo.endswith('.txt'):
+                        archivo_encontrado = archivo
+                        break
+            
+            if not archivo_encontrado:
+                raise FileNotFoundError("No se encontró ningún archivo .txt en el zip")
+            
+            print(f"Usando archivo: {archivo_encontrado}")
+            
+            with zip_ref.open(archivo_encontrado) as file:
+                contenido = file.read().decode('utf-8')
+        
+        return procesar_contenido(contenido)
+    
+    except Exception as e:
+        print(f"Error al extraer del zip: {e}")
+        return []
+
+def procesar_contenido(contenido):
+    """Procesa el contenido del archivo"""
+    lineas = contenido.strip().split('\n')
+    pares = []
+    
+    for i, linea in enumerate(lineas):
+        linea = linea.strip()
+        if not linea:
+            continue
+            
+        # Diferentes separadores posibles
+        separadores = ['\t', '|', '  ', ' - ']
+        partes = None
+        
+        for sep in separadores:
+            if sep in linea:
+                partes = linea.split(sep)
+                if len(partes) >= 2:
+                    break
+        
+        if partes and len(partes) >= 2:
+            texto1 = partes[0].strip()
+            texto2 = partes[1].strip()
+            
+            # Limpiar texto
+            texto1 = re.sub(r'[^\w\s!?¡¿.,]', '', texto1)
+            texto2 = re.sub(r'[^\w\s!?.,]', '', texto2)
+            
+            if (len(texto1.split()) <= 15 and len(texto2.split()) <= 15 and 
+                len(texto1) > 0 and len(texto2) > 0):
+                # Agregar en ambas direcciones para entrenamiento bidireccional
+                pares.append((texto1.lower(), texto2.lower()))
+                pares.append((texto2.lower(), texto1.lower()))  # Dirección inversa
+        
+        if i % 10000 == 0 and i > 0:
+            print(f"Procesadas {i} líneas...")
+    
+    return pares
+
+# Cargar datos
+print("Cargando datos del archivo zip...")
+pares_traduccion = extraer_y_procesar_datos('archive.zip')
+
+if not pares_traduccion:
+    print("No se pudieron cargar datos. Verifica el archivo zip.")
+    exit()
+
+print(f"Se cargaron {len(pares_traduccion)} pares de traducción (bidireccionales)")
+
+# Mostrar ejemplos
+print("\n--- Ejemplos de datos cargados ---")
+for i in range(min(5, len(pares_traduccion))):
+    print(f"'{pares_traduccion[i][0]}' -> '{pares_traduccion[i][1]}'")
+
+# Vocabulario unificado para ambos idiomas
+class VocabularioUnificado:
+    def __init__(self):
+        self.palabra_a_indice = {'<PAD>': 0, '<SOS>': 1, '<EOS>': 2, '<UNK>': 3}
+        self.indice_a_palabra = {0: '<PAD>', 1: '<SOS>', 2: '<EOS>', 3: '<UNK>'}
+        self.contador = Counter()
+        self.num_palabras = 4
+    
+    def agregar_oracion(self, oracion):
+        for palabra in oracion.split():
+            palabra = re.sub(r'[^\w]', '', palabra)
+            if palabra:
+                self.contador[palabra] += 1
+    
+    def construir_vocabulario(self, tam_minimo=1):
+        palabras_ordenadas = sorted(self.contador.items(), key=lambda x: x[1], reverse=True)
+        
+        for palabra, count in palabras_ordenadas:
+            if count >= tam_minimo and palabra not in self.palabra_a_indice:
+                self.palabra_a_indice[palabra] = self.num_palabras
+                self.indice_a_palabra[self.num_palabras] = palabra
+                self.num_palabras += 1
+        
+        print(f"Vocabulario unificado: {self.num_palabras} palabras")
+    
+    def oracion_a_indices(self, oracion):
+        indices = []
+        for palabra in oracion.split():
+            palabra_limpia = re.sub(r'[^\w]', '', palabra)
+            if palabra_limpia:
+                indices.append(self.palabra_a_indice.get(palabra_limpia, 3))
+        return indices
+    
+    def indices_a_oracion(self, indices):
+        palabras = []
+        for idx in indices:
+            if idx in [0, 1, 2]:
+                continue
+            palabras.append(self.indice_a_palabra.get(idx, '<UNK>'))
+        return ' '.join(palabras)
+    
+    def detectar_idioma(self, oracion):
+        """Detecta si una oración es más probable en español o inglés"""
+        palabras = oracion.lower().split()
+        if not palabras:
+            return "desconocido"
+        
+        # Palabras características de cada idioma
+        palabras_es = ['el', 'la', 'los', 'las', 'de', 'que', 'y', 'en', 'un', 'una', 'es', 'son', 'con', 'por', 'para']
+        palabras_en = ['the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are']
+        
+        contador_es = sum(1 for palabra in palabras if palabra in palabras_es)
+        contador_en = sum(1 for palabra in palabras if palabra in palabras_en)
+        
+        if contador_es > contador_en:
+            return "español"
+        elif contador_en > contador_es:
+            return "inglés"
+        else:
+            return "indeterminado"
+
+# Construir vocabulario unificado
+print("\nConstruyendo vocabulario unificado...")
+vocabulario = VocabularioUnificado()
+
+for texto1, texto2 in pares_traduccion:
+    vocabulario.agregar_oracion(texto1)
+    vocabulario.agregar_oracion(texto2)
+
+vocabulario.construir_vocabulario(tam_minimo=1)
+
+# Dataset
+class DatasetTraduccionBidireccional(Dataset):
+    def __init__(self, pares, vocabulario, max_longitud=15):
+        self.pares = []
+        self.vocabulario = vocabulario
+        self.max_longitud = max_longitud
+        
+        for texto1, texto2 in pares:
+            if (len(texto1.split()) <= max_longitud - 2 and 
+                len(texto2.split()) <= max_longitud - 2):
+                self.pares.append((texto1, texto2))
+    
+    def __len__(self):
+        return len(self.pares)
+    
+    def __getitem__(self, idx):
+        texto1, texto2 = self.pares[idx]
+        
+        indices_entrada = [1] + self.vocabulario.oracion_a_indices(texto1) + [2]
+        indices_salida = [1] + self.vocabulario.oracion_a_indices(texto2) + [2]
+        
+        indices_entrada = self._aplicar_padding(indices_entrada)
+        indices_salida = self._aplicar_padding(indices_salida)
+        
+        return (torch.tensor(indices_entrada, dtype=torch.long),
+                torch.tensor(indices_salida, dtype=torch.long))
+    
+    def _aplicar_padding(self, indices):
+        if len(indices) < self.max_longitud:
+            return indices + [0] * (self.max_longitud - len(indices))
+        else:
+            return indices[:self.max_longitud-1] + [2]
+
+# Modelos (los mismos que antes)
+class Encoder(nn.Module):
+    def __init__(self, tam_vocabulario, tam_embedding, tam_oculto, num_capas=2, dropout=0.3):
+        super(Encoder, self).__init__()
+        self.tam_oculto = tam_oculto
+        self.num_capas = num_capas
+        self.embedding = nn.Embedding(tam_vocabulario, tam_embedding, padding_idx=0)
+        self.gru = nn.GRU(tam_embedding, tam_oculto, num_capas, 
+                         dropout=dropout if num_capas > 1 else 0, 
+                         batch_first=True, bidirectional=True)
+        self.fc = nn.Linear(tam_oculto * 2, tam_oculto)
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        embedded = self.dropout(self.embedding(x))
+        outputs, hidden = self.gru(embedded)
+        hidden = torch.tanh(self.fc(torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim=1)))
+        hidden = hidden.unsqueeze(0).repeat(self.num_capas, 1, 1)
+        return outputs, hidden
+
+class Attention(nn.Module):
+    def __init__(self, tam_oculto):
+        super(Attention, self).__init__()
+        self.attn = nn.Linear(tam_oculto * 3, tam_oculto)
+        self.v = nn.Linear(tam_oculto, 1, bias=False)
+    
+    def forward(self, hidden, encoder_outputs):
+        batch_size = encoder_outputs.shape[0]
+        src_len = encoder_outputs.shape[1]
+        hidden = hidden.unsqueeze(1).repeat(1, src_len, 1)
+        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))
+        attention = self.v(energy).squeeze(2)
+        return torch.softmax(attention, dim=1).unsqueeze(1)
+
+class Decoder(nn.Module):
+    def __init__(self, tam_vocabulario, tam_embedding, tam_oculto, num_capas=2, dropout=0.3):
+        super(Decoder, self).__init__()
+        self.tam_oculto = tam_oculto
+        self.num_capas = num_capas
+        self.embedding = nn.Embedding(tam_vocabulario, tam_embedding, padding_idx=0)
+        self.attention = Attention(tam_oculto)
+        self.gru = nn.GRU(tam_embedding + tam_oculto * 2, tam_oculto, num_capas,
+                         dropout=dropout if num_capas > 1 else 0, batch_first=True)
+        self.fc_out = nn.Linear(tam_oculto * 3 + tam_embedding, tam_vocabulario)
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x, hidden, encoder_outputs):
+        x = x.unsqueeze(1)
+        embedded = self.dropout(self.embedding(x))
+        a = self.attention(hidden[-1], encoder_outputs)
+        weighted = torch.bmm(a, encoder_outputs)
+        gru_input = torch.cat((embedded, weighted), dim=2)
+        output, hidden = self.gru(gru_input, hidden)
+        output = output.squeeze(1)
+        weighted = weighted.squeeze(1)
+        embedded = embedded.squeeze(1)
+        prediction = self.fc_out(torch.cat((output, weighted, embedded), dim=1))
+        return prediction, hidden, a
+
+class Seq2Seq(nn.Module):
+    def __init__(self, encoder, decoder):
+        super(Seq2Seq, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+    
+    def forward(self, src, trg, teacher_forcing_ratio=0.5):
+        batch_size = src.shape[0]
+        trg_len = trg.shape[1]
+        trg_vocab_size = self.decoder.fc_out.out_features
+        outputs = torch.zeros(batch_size, trg_len, trg_vocab_size).to(device)
+        encoder_outputs, hidden = self.encoder(src)
+        input = trg[:, 0]
+        
+        for t in range(1, trg_len):
+            output, hidden, _ = self.decoder(input, hidden, encoder_outputs)
+            outputs[:, t] = output
+            teacher_force = random.random() < teacher_forcing_ratio
+            top1 = output.argmax(1)
+            input = trg[:, t] if teacher_force else top1
+        
+        return outputs
+
+# Hiperparámetros
+TAM_EMBEDDING = 128
+TAM_OCULTO = 256
+NUM_CAPAS = 2
+DROPOUT = 0.2
+TASA_APRENDIZAJE = 0.001
+EPOCHS = 25
+TAM_BATCH = 32
+MAX_LONGITUD = 15
+
+# Preparar datos
+print("\nPreparando datos para entrenamiento...")
+dataset_completo = DatasetTraduccionBidireccional(pares_traduccion, vocabulario, MAX_LONGITUD)
+
+tam_entrenamiento = int(0.9 * len(dataset_completo))
+tam_validacion = len(dataset_completo) - tam_entrenamiento
+
+dataset_entrenamiento, dataset_validacion = torch.utils.data.random_split(
+    dataset_completo, [tam_entrenamiento, tam_validacion]
+)
+
+dataloader_entrenamiento = DataLoader(dataset_entrenamiento, batch_size=TAM_BATCH, shuffle=True)
+dataloader_validacion = DataLoader(dataset_validacion, batch_size=TAM_BATCH, shuffle=False)
+
+print(f"Datos de entrenamiento: {len(dataset_entrenamiento)}")
+print(f"Datos de validación: {len(dataset_validacion)}")
+
+# Inicializar modelo
+encoder = Encoder(vocabulario.num_palabras, TAM_EMBEDDING, TAM_OCULTO, NUM_CAPAS, DROPOUT)
+decoder = Decoder(vocabulario.num_palabras, TAM_EMBEDDING, TAM_OCULTO, NUM_CAPAS, DROPOUT)
+modelo = Seq2Seq(encoder, decoder).to(device)
+
+print(f"\nModelo creado - Parámetros totales: {sum(p.numel() for p in modelo.parameters()):,}")
+
+# Entrenamiento
+criterio = nn.CrossEntropyLoss(ignore_index=0)
+optimizador = optim.Adam(modelo.parameters(), lr=TASA_APRENDIZAJE)
+
+def entrenar_epoch(modelo, dataloader, criterio, optimizador, teacher_forcing_ratio=0.5):
+    modelo.train()
+    perdida_epoch = 0
+    for src, trg in dataloader:
+        src, trg = src.to(device), trg.to(device)
+        optimizador.zero_grad()
+        output = modelo(src, trg, teacher_forcing_ratio)
+        output_dim = output.shape[-1]
+        output = output[:, 1:].reshape(-1, output_dim)
+        trg = trg[:, 1:].reshape(-1)
+        perdida = criterio(output, trg)
+        perdida.backward()
+        torch.nn.utils.clip_grad_norm_(modelo.parameters(), max_norm=1)
+        optimizador.step()
+        perdida_epoch += perdida.item()
+    return perdida_epoch / len(dataloader)
+
+def evaluar(modelo, dataloader, criterio):
+    modelo.eval()
+    perdida_epoch = 0
+    with torch.no_grad():
+        for src, trg in dataloader:
+            src, trg = src.to(device), trg.to(device)
+            output = modelo(src, trg, 0)
+            output_dim = output.shape[-1]
+            output = output[:, 1:].reshape(-1, output_dim)
+            trg = trg[:, 1:].reshape(-1)
+            perdida = criterio(output, trg)
+            perdida_epoch += perdida.item()
+    return perdida_epoch / len(dataloader)
+
+print("\nIniciando entrenamiento...")
+mejor_perdida = float('inf')
+
+for epoch in range(EPOCHS):
+    perdida_train = entrenar_epoch(modelo, dataloader_entrenamiento, criterio, optimizador)
+    perdida_val = evaluar(modelo, dataloader_validacion, criterio)
+    
+    if perdida_val < mejor_perdida:
+        mejor_perdida = perdida_val
+        torch.save(modelo.state_dict(), 'mejor_modelo_bidireccional.pth')
+    
+    if epoch % 3 == 0:
+        print(f'Epoch {epoch+1:02d}: Train={perdida_train:.4f}, Val={perdida_val:.4f}')
+
+# Cargar mejor modelo
+modelo.load_state_dict(torch.load('mejor_modelo_bidireccional.pth'))
+print("Mejor modelo cargado")
+
+# FUNCIÓN PRINCIPAL DE TRADUCCIÓN BIDIRECCIONAL
+def traducir_automatico(texto, modelo, vocabulario, max_longitud=15):
+    """Traduce automáticamente detectando el idioma de entrada"""
+    modelo.eval()
+    
+    # Preprocesar texto
+    texto_limpio = re.sub(r'[^\w\s!?¡¿.,]', '', texto.lower())
+    
+    # Detectar idioma
+    idioma_entrada = vocabulario.detectar_idioma(texto_limpio)
+    print(f"🔍 Idioma detectado: {idioma_entrada}")
+    
+    # Convertir a índices
+    tokens = [1] + vocabulario.oracion_a_indices(texto_limpio) + [2]
+    tokens = tokens[:max_longitud-1] + [2] if len(tokens) > max_longitud else tokens + [0] * (max_longitud - len(tokens))
+    
+    src_tensor = torch.LongTensor(tokens).unsqueeze(0).to(device)
+    
+    with torch.no_grad():
+        encoder_outputs, hidden = modelo.encoder(src_tensor)
+        trg_indices = [1]
+        
+        for _ in range(max_longitud - 1):
+            trg_tensor = torch.LongTensor([trg_indices[-1]]).to(device)
+            output, hidden, _ = modelo.decoder(trg_tensor, hidden, encoder_outputs)
+            
+            pred_token = output.argmax(1).item()
+            trg_indices.append(pred_token)
+            
+            if pred_token == 2:  # EOS
+                break
+        
+        traduccion = vocabulario.indices_a_oracion(trg_indices)
+        
+        # Determinar idioma de salida
+        idioma_salida = vocabulario.detectar_idioma(traduccion)
+        
+        return traduccion, idioma_entrada, idioma_salida
+
+# PROBAR EL TRADUCTOR BIDIRECCIONAL
+print("\n" + "="*60)
+print("🎯 TRADUCTOR BIDIRECCIONAL ESPAÑOL ↔ INGLÉS")
+print("="*60)
+
+textos_prueba = [
+    "hola",
+    "hello", 
+    "como estas",
+    "how are you",
+    "gracias",
+    "thank you",
+    "te amo",
+    "i love you",
+    "buenos dias",
+    "good morning",
+    "donde esta el baño",
+    "where is the bathroom",
+    "quiero agua",
+    "i want water",
+    "ayuda",
+    "help"
+]
+
+print("\n🔍 Probando traducción automática:")
+for texto in textos_prueba:
+    try:
+        traduccion, idioma_entrada, idioma_salida = traducir_automatico(texto, modelo, vocabulario)
+        flecha = "↔"
+        print(f"  '{texto:20}' {flecha} '{traduccion:20}' | Entrada: {idioma_entrada:12} → Salida: {idioma_salida}")
+    except Exception as e:
+        print(f"  Error con '{texto}': {e}")
+
+# INTERFAZ INTERACTIVA
+def interfaz_traductor():
+    """Interfaz para usar el traductor continuamente"""
+    print("\n" + "="*50)
+    print("💬 TRADUCTOR INTERACTIVO")
+    print("Escribe frases en español o inglés y las traducirá automáticamente")
+    print("Escribe 'salir' para terminar")
+    print("="*50)
+    
+    while True:
+        try:
+            texto = input("\n📝 Escribe una frase: ").strip()
+            
+            if texto.lower() in ['salir', 'exit', 'quit']:
+                print("¡Hasta luego!")
+                break
+            
+            if not texto:
+                continue
+            
+            traduccion, idioma_entrada, idioma_salida = traducir_automatico(texto, modelo, vocabulario)
+            
+            print(f"🔤 Entrada ({idioma_entrada}): {texto}")
+            print(f"🌍 Salida ({idioma_salida}): {traduccion}")
+            
+        except KeyboardInterrupt:
+            print("\n\n¡Hasta luego!")
+            break
+        except Exception as e:
+            print(f"❌ Error: {e}")
+
+# Ejecutar interfaz interactiva
+interfaz_traductor()
+
+# Guardar modelo completo
+torch.save({
+    'modelo_state_dict': modelo.state_dict(),
+    'vocabulario': vocabulario,
+    'hiperparametros': {
+        'TAM_EMBEDDING': TAM_EMBEDDING,
+        'TAM_OCULTO': TAM_OCULTO,
+        'NUM_CAPAS': NUM_CAPAS,
+        'DROPOUT': DROPOUT,
+        'MAX_LONGITUD': MAX_LONGITUD
+    }
+}, 'traductor_bidireccional.pth')
+
+print(f"\n✅ Entrenamiento completado!")
+print(f"📁 Modelo guardado: 'traductor_bidireccional.pth'")
+print(f"🔤 Vocabulario unificado: {vocabulario.num_palabras} palabras")
